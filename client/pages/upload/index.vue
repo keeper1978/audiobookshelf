@@ -307,40 +307,59 @@ export default {
       }
     },
     async uploadItem(item) {
-      var form = new FormData()
-      form.set('title', item.title)
-      if (!this.selectedLibraryIsPodcast) {
-        form.set('author', item.author || '')
-        form.set('series', item.series || '')
+      const chunkSize = 8 * 1024 * 1024
+      const fingerprint = [this.selectedLibraryId, this.selectedFolderId, item.title, item.author, item.series]
+        .concat(item.files.map((file) => `${file.name}:${file.size}:${file.lastModified}`))
+        .join('|')
+      // This deliberately avoids Web Crypto because many self-hosted instances run over
+      // plain HTTP on a LAN, where crypto.subtle is unavailable. The server also verifies
+      // the complete session metadata before accepting an existing upload ID.
+      const hashFingerprint = (seed) => {
+        let hash = seed
+        for (let index = 0; index < fingerprint.length; index++) {
+          hash ^= fingerprint.charCodeAt(index)
+          hash = Math.imul(hash, 16777619)
+        }
+        return (hash >>> 0).toString(16).padStart(8, '0')
       }
-      form.set('library', this.selectedLibraryId)
-      form.set('folder', this.selectedFolderId)
+      const uploadId = [2166136261, 2166136261 ^ 0x9e3779b9, 2166136261 ^ 0x85ebca6b, 2166136261 ^ 0xc2b2ae35].map(hashFingerprint).join('')
+      const total = item.files.reduce((sum, file) => sum + file.size, 0)
 
-      var index = 0
-      item.files.forEach((file) => {
-        form.set(`${index++}`, file)
-      })
+      try {
+        const upload = await this.$axios.$post('/api/upload/resumable', {
+          uploadId,
+          title: item.title,
+          author: this.selectedLibraryIsPodcast ? null : item.author || '',
+          series: this.selectedLibraryIsPodcast ? null : item.series || '',
+          library: this.selectedLibraryId,
+          folder: this.selectedFolderId,
+          files: item.files.map((file) => ({ name: file.name, size: file.size }))
+        })
+        const offsets = upload.offsets
 
-      const config = {
-        onUploadProgress: (progressEvent) => {
-          if (progressEvent.lengthComputable) {
-            const progress = {
-              loaded: progressEvent.loaded,
-              total: progressEvent.total
-            }
-            this.updateItemCardProgress(item.index, progress)
+        for (let fileIndex = 0; fileIndex < item.files.length; fileIndex++) {
+          const file = item.files[fileIndex]
+          let offset = offsets[fileIndex]
+          while (offset < file.size) {
+            const end = Math.min(offset + chunkSize, file.size)
+            const chunk = file.slice(offset, end, 'application/octet-stream')
+            const previouslyUploaded = offsets.reduce((sum, value, index) => sum + (index < fileIndex ? item.files[index].size : index === fileIndex ? offset : value), 0)
+            const response = await this.$axios.patch(`/api/upload/resumable/${uploadId}/${fileIndex}`, chunk, {
+              headers: { 'Content-Type': 'application/octet-stream', 'Upload-Offset': String(offset) },
+              onUploadProgress: (event) => this.updateItemCardProgress(item.index, { loaded: previouslyUploaded + event.loaded, total })
+            })
+            offset = Number(response.headers['upload-offset'])
+            offsets[fileIndex] = offset
           }
         }
-      }
 
-      return this.$axios
-        .$post('/api/upload', form, config)
-        .then(() => true)
-        .catch((error) => {
-          console.error('Failed to upload item', error)
-          this.$toast.error(error.response?.data || 'Oops, something went wrong...')
-          return false
-        })
+        await this.$axios.$post(`/api/upload/resumable/${uploadId}/complete`)
+        return true
+      } catch (error) {
+        console.error('Failed to upload item', error)
+        this.$toast.error(error.response?.data?.message || error.response?.data || 'Oops, something went wrong...')
+        return false
+      }
     },
     validateItems() {
       var itemData = []
@@ -401,13 +420,15 @@ export default {
         }
       }
 
+      let allUploadsSucceeded = true
       for (const item of itemsToUpload) {
         this.updateItemCardStatus(item.index, 'uploading')
         const result = await this.uploadItem(item)
+        allUploadsSucceeded = allUploadsSucceeded && result
         this.updateItemCardStatus(item.index, result ? 'success' : 'failed')
       }
       this.processing = false
-      this.uploadFinished = true
+      this.uploadFinished = allUploadsSucceeded
     }
   },
   mounted() {
