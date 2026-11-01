@@ -2,6 +2,9 @@ name: Build resumable Audiobookshelf image
 
 on:
   workflow_dispatch:
+  push:
+    branches:
+      - codex/update-audiobookshelf-2.37.2
 
 permissions:
   contents: read
